@@ -1,143 +1,178 @@
 """
 Face detection
 """
-import cv2
 import os
-from time import sleep
+from time import time
+
+import cv2
+import keras.backend.tensorflow_backend as KTF
 import numpy as np
-import argparse
+from scipy import misc
+import tensorflow as tf
+
+import RTSCapture
+import align.detect_face
 from wide_resnet import WideResNet
-from keras.utils.data_utils import get_file
 
-class FaceCV(object):
-    """
-    Singleton class for face recongnition task
-    """
-    CASE_PATH = ".\\pretrained_models\\haarcascade_frontalface_alt.xml"
-    WRN_WEIGHTS_PATH = "https://github.com/Tony607/Keras_age_gender/releases/download/V1.0/weights.18-4.06.hdf5"
+os.environ['CUDA_VISIBLE_DEVICES']='-1'
+rate = 0.2
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True  # 不全部占满显存, 按需分配
+config.gpu_options.per_process_gpu_memory_fraction = rate  # 指定分配30%空间
+sess = tf.Session(config=config)  # 设置session
+KTF.set_session(sess)
+"""
+Singleton class for face recongnition task
+"""
+WRN_WEIGHTS_PATH = "./pretrained_models/weights.18-4.06.hdf5"
+face_size = 64
+model = WideResNet(face_size, depth=16, k=8)()
+model.load_weights(WRN_WEIGHTS_PATH)
+# gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=rate, allow_growth=True)
+# sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
+# with tf.Session(config=config) as sess:
+pnet, rnet, onet = align.detect_face.create_mtcnn(sess, None)
 
 
-    def __new__(cls, weight_file=None, depth=16, width=8, face_size=64):
-        if not hasattr(cls, 'instance'):
-            cls.instance = super(FaceCV, cls).__new__(cls)
-        return cls.instance
+def load_and_align_data(img, image_size, margin):
+    minsize = 20  # minimum size of face
+    threshold = [0.6, 0.7, 0.7]  # three steps's threshold
+    factor = 0.709  # scale factor
 
-    def __init__(self, depth=16, width=8, face_size=64):
-        self.face_size = face_size
-        self.model = WideResNet(face_size, depth=depth, k=width)()
-        model_dir = os.path.join(os.getcwd(), "pretrained_models").replace("//", "\\")
-        fpath = get_file('weights.18-4.06.hdf5',
-                         self.WRN_WEIGHTS_PATH,
-                         cache_subdir=model_dir)
-        self.model.load_weights(fpath)
+    img_size = np.asarray(img.shape)[0:2]
 
-    @classmethod
-    def draw_label(cls, image, point, label, font=cv2.FONT_HERSHEY_SIMPLEX,
-                   font_scale=1, thickness=2):
-        size = cv2.getTextSize(label, font, font_scale, thickness)[0]
-        x, y = point
-        cv2.rectangle(image, (x, y - size[1]), (x + size[0], y), (255, 0, 0), cv2.FILLED)
-        cv2.putText(image, label, point, font, font_scale, (255, 255, 255), thickness)
+    # bounding_boxes shape:(1,5)  type:np.ndarray
+    bounding_boxes, _ = align.detect_face.detect_face(img, minsize, pnet, rnet, onet, threshold, factor)
 
-    def crop_face(self, imgarray, section, margin=40, size=64):
-        """
-        :param imgarray: full image
-        :param section: face detected area (x, y, w, h)
-        :param margin: add some margin to the face detected area to include a full head
-        :param size: the result image resolution with be (size x size)
-        :return: resized image in numpy array with shape (size x size x 3)
-        """
-        img_h, img_w, _ = imgarray.shape
-        if section is None:
-            section = [0, 0, img_w, img_h]
-        (x, y, w, h) = section
-        margin = int(min(w,h) * margin / 100)
-        x_a = x - margin
-        y_a = y - margin
-        x_b = x + w + margin
-        y_b = y + h + margin
-        if x_a < 0:
-            x_b = min(x_b - x_a, img_w-1)
-            x_a = 0
-        if y_a < 0:
-            y_b = min(y_b - y_a, img_h-1)
-            y_a = 0
-        if x_b > img_w:
-            x_a = max(x_a - (x_b - img_w), 0)
-            x_b = img_w
-        if y_b > img_h:
-            y_a = max(y_a - (y_b - img_h), 0)
-            y_b = img_h
-        cropped = imgarray[y_a: y_b, x_a: x_b]
-        resized_img = cv2.resize(cropped, (size, size), interpolation=cv2.INTER_AREA)
-        resized_img = np.array(resized_img)
-        return resized_img, (x_a, y_a, x_b - x_a, y_b - y_a)
+    # 如果未发现目标 直接返回
+    if len(bounding_boxes) < 1:
+        return 0, 0, 0
 
-    def detect_face(self):
-        face_cascade = cv2.CascadeClassifier(self.CASE_PATH)
+    # 从数组的形状中删除单维度条目，即把shape中为1的维度去掉
+    # det = np.squeeze(bounding_boxes[:,0:4])
+    det = bounding_boxes
 
-        # 0 means the default video capture device in OS
-        video_capture = cv2.VideoCapture(0)
-        # infinite loop, break by key ESC
-        while True:
-            if not video_capture.isOpened():
-                sleep(5)
-            # Capture frame-by-frame
-            ret, frame = video_capture.read()
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.2,
-                minNeighbors=10,
-                minSize=(self.face_size, self.face_size)
-            )
-            # placeholder for cropped faces
-            face_imgs = np.empty((len(faces), self.face_size, self.face_size, 3))
-            for i, face in enumerate(faces):
-                face_img, cropped = self.crop_face(frame, face, margin=40, size=self.face_size)
-                (x, y, w, h) = cropped
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 200, 0), 2)
-                face_imgs[i,:,:,:] = face_img
-            if len(face_imgs) > 0:
+    det_temp = det
+
+    det[:, 0] = np.maximum(det[:, 0], 0)
+    det[:, 1] = np.maximum(det[:, 1], 0)
+    det[:, 2] = np.minimum(det[:, 2], img_size[1] - 1)
+    det[:, 3] = np.minimum(det[:, 3], img_size[0] - 1)
+
+    det_temp[:, 0] = np.maximum(det_temp[:, 0] - margin / 2, 0)
+    det_temp[:, 1] = np.maximum(det_temp[:, 1] - margin / 2, 0)
+    det_temp[:, 2] = np.minimum(det_temp[:, 2] + margin / 2, img_size[1] - 1)
+    det_temp[:, 3] = np.minimum(det_temp[:, 3] + margin / 2, img_size[0] - 1)
+    det_temp = det_temp.astype(int)
+    det = det.astype(int)
+    crop = []
+    for i in range(len(bounding_boxes)):
+        w = abs(det[i, 0] - det[i, 2])
+        h = abs(det[i, 1] - det[i, 3])
+        if w > h:
+            D = abs(w - h)
+            newx1 = det[i, 0]
+            newx2 = det[i, 2]
+            newy1 = int(det[i, 1] - D / 2)
+            newy2 = int(det[i, 3] + D / 2)
+            if newy1 < 0:
+                newy1 = 0
+            if newy2 >= img.shape[0]:
+                newy2 = img.shape[0] - 1
+                # img.shape[0]：图像的垂直尺寸（高度）
+                # img.shape[1]：图像的水平尺寸（宽度）
+                # img.shape[2]：图像的通道数
+        else:
+            D = abs(w - h)
+            newx1 = int(det[i, 0] - D / 2)
+            newx2 = int(det[i, 2] + D / 2)
+            newy1 = det[i, 1]
+            newy2 = det[i, 3]
+            if newx1 < 0:
+                newx1 = 0
+            if newx2 >= img.shape[1]:
+                newx2 = img.shape[1] - 1
+                # img.shape[0]：图像的垂直尺寸（高度）
+                # img.shape[1]：图像的水平尺寸（宽度）
+                # img.shape[2]：图像的通道数
+        temp_crop = img[newy1:newy2, newx1:newx2, :]
+
+        # print(temp_crop.shape)
+
+        # temp_crop = img[det[i, 1]:det[i, 3], det[i, 0]:det[i, 2], :]
+        aligned = misc.imresize(temp_crop, (image_size, image_size), interp='bilinear')
+        crop.append(aligned)
+
+    # np.stack 将crop由一维list变为二维
+    crop_image = np.stack(crop)
+    return 1, det_temp, crop_image
+
+
+def detect_face(scale=2):
+    timer = 0
+    rtscap = RTSCapture.RTSCapture.create(0)
+    rtscap.start_read()  # 启动子线程并改变 read_latest_frame 的指向
+    rtscap.set(3, 640 // scale)
+    rtscap.set(4, 480 // scale)
+    while rtscap.isStarted():
+        timer += 1
+        start_time = time()
+        # Capture frame-by-frame
+        ret, frame = rtscap.read_latest_frame()
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("esc break...")
+            break
+        if not ret:
+            continue
+        resize_img = cv2.resize(frame, (int(frame.shape[1]), int(frame.shape[0])))
+        mark, bounding_box, crop_image = load_and_align_data(resize_img, face_size, 44)
+        if (mark):
+            face_imgs = np.empty((len(bounding_box), face_size, face_size, 3))
+            for i in range(len(bounding_box)):
+                face_img = crop_image[i]
+                # print(face_img.shape)
+                face_imgs[i, :, :, :] = face_img
                 # predict ages and genders of the detected faces
-                results = self.model.predict(face_imgs)
-                predicted_genders = results[0]
+            results = model.predict(face_imgs)
+            # print(results)
+            # print(len(results))
+            predicted_genders = results[0]
+            # print(len(predicted_genders))
+            for j in range(len(predicted_genders)):
+                x1 = int(bounding_box[j, 0])
+                y1 = int(bounding_box[j, 1])
+                x2 = int(bounding_box[j, 2])
+                y2 = int(bounding_box[j, 3])
+                # print(predicted_genders)
                 ages = np.arange(0, 101).reshape(101, 1)
                 predicted_ages = results[1].dot(ages).flatten()
-            # draw results
-            for i, face in enumerate(faces):
-                label = "{}, {}".format(int(predicted_ages[i]),
-                                        "F" if predicted_genders[i][0] > 0.5 else "M")
-                self.draw_label(frame, (face[0], face[1]), label)
+                # print(predicted_genders)
+                label = "{}, {}".format(int(predicted_ages[j]),
+                                        "F" if predicted_genders[j][0] > 0.5 else "M")
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, label, (x1, y1), cv2.FONT_HERSHEY_COMPLEX_SMALL,
+                            1,
+                            (255, 255, 255),
+                            thickness=1,
+                            lineType=2)
+                print(label)
+                # draw_label(frame, (x1, y1), label)
+                # cv2.imshow('face_img', face_img)
+        cv2.imshow('Keras Faces', frame)
+        timer += 1
+        end_time = time()
+        t = end_time - start_time
+        # print(1 // t)
+        print(str(int(t * 1000)) + 'ms')
+    # When everything is done, release the capture
+    rtscap.stop_read()
+    rtscap.release()
+    cv2.destroyAllWindows()
 
-            cv2.imshow('Keras Faces', frame)
-            if cv2.waitKey(5) == 27:  # ESC key press
-                break
-        # When everything is done, release the capture
-        video_capture.release()
-        cv2.destroyAllWindows()
-
-
-def get_args():
-    parser = argparse.ArgumentParser(description="This script detects faces from web cam input, "
-                                                 "and estimates age and gender for the detected faces.",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-    parser.add_argument("--depth", type=int, default=16,
-                        help="depth of network")
-    parser.add_argument("--width", type=int, default=8,
-                        help="width of network")
-    args = parser.parse_args()
-    return args
 
 def main():
-    args = get_args()
-    depth = args.depth
-    width = args.width
+    detect_face(1)
 
-    face = FaceCV(depth=depth, width=width)
-
-    face.detect_face()
 
 if __name__ == "__main__":
     main()
